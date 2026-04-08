@@ -355,16 +355,77 @@ The Response ID=5 **SDSIO_CMD_PING** returns the `Status` with nonzero = server 
 |******|******|********|******|
 ```
 
+**SDSIO_CMD_INFO**
+
+The Command with ID = 7 (SDSIO_CMD_INFO) sends control information (sdsFlags, idleRate and error information) to the Host. There is no Response from the SDSIO Server to this Command.
+
+- sdsFlags is the current value of the `sdsFlags` global variable.
+- sdsIdleRate is the current value of the `sdsIdleRate` global variable, value 0xFFFFFFFFF indicates that there is no idle rate information.
+- Error Len specifies the size of the Error Data, value 0 indicates that no error occurred.
+
+```txt
+| WORD | WORD     | WORD        | WORD      |++++++++++++|
+>  7   | sdsFlags | sdsIdleRate | Error Len | Error Data |
+|******|**********|*************|***********|++++++++++++|
+```
+
+Error Data contains the information from `sdsError` global structure and has the following format.
+
+```txt
+| WORD   | WORD |++++++++++++++++++++|
+| Status | Line | File name (string) |
+|********|******|++++++++++++++++++++|
+```
+
 ## SDSIO Message Sequence
 
-This is the message sequence of the SDS **DataTest** example using SDSIO Server.
+This section describes the states and the message sequence of the SDS framework when using the `SDSIO-Server`.
 It contains the following threads that execute on the target.
 
-- **Control**: Overall execution Control thread (sdsControlThread)
-- **Algorithm**: Algorithm under test thread (AlgorithmThread)
-- **Recorder/Playback**: SDS Recorder/Playback thread (sdsRecPlayThread)
+- **sdsControlThread**: Control thread that organizes the overall execution.
+- **AlgorithmThread**: Executes the algorithm under test.
+- **sdsRecPlayThread**: Recorder/Playback interface to SDSIO-Server.
+- **SDSIO-Server**: SDSIO-Server running on host computer.
 
-The **Server** is the **SDSIO Server** executing on the target system.
+!!! Note
+    - The command `SDS_CMD_FLAGS` is sent asynchronous by the SDSIO-Server.
+
+States                   | Description
+:------------------------|:------------
+SDS_STATE_INACTIVE       | Streaming is not active; initiate connection to SDSIO-Server
+SDS_STATE_CONNECTED      | Device (client) is connected to SDSIO-Server (host)
+SDS_STATE_START          | Request to start streaming, open streams and get ready for read/write operations
+SDS_STATE_ACTIVE         | Streaming is active
+SDS_STATE_STOP_REQ       | Request to stop streaming and close streams
+SDS_STATE_STOP_DONE      | Streaming is stopped
+SDS_STATE_END            | Request to end streaming (no more data to send to SDSIO-Server)
+
+The following flowcharts show the state transition in context with the messages that are exchanged with the `SDSIO-Server`.
+
+**Connect flowchart**
+
+```mermaid
+sequenceDiagram
+    participant sdsControlThread
+    activate sdsControlThread
+
+    participant AlgorithmThread
+    participant SDSIO as sdsRecPlayThread
+    participant Server as SDSIO-Server<br/>(host)
+
+    activate Server
+    Note right of sdsControlThread: SDS_STATE_INACTIVE 
+    Note over sdsControlThread: sdsInit
+    Note over sdsControlThread: sdsExchange
+    sdsControlThread->>Server: SDSIO_CMD_INFO
+    Server-->>sdsControlThread: SDSIO_CMD_FLAGS: set SDS_FLAG_ALIVE
+    Note right of sdsControlThread: SDS_STATE_CONNECTED 
+    deactivate sdsControlThread
+```
+
+!!! Note
+    - When the command `SDS_CMD_FLAGS` sets SDS_FLAG_ALIVE the sdsControlThread transitions into the SDS_STATE_CONNECTED.
+    - When `SDSIO_CMD_INFO` is send more than 10 times without a `SDS_CMD_FLAGS` response the sdsControlThread transitions into the SDS_STATE_INACTIVE.
 
 **Recording flowchart**
 
@@ -374,44 +435,59 @@ sequenceDiagram
     activate sdsControlThread
 
     participant AlgorithmThread
-    participant Recorder as sdsRecPlayThread
-    participant Server as SDSIO Server
+    participant SDSIO as sdsRecPlayThread
+    participant Server as SDSIO-Server<br/>(host)
 
+    Note right of sdsControlThread: SDS_STATE_CONNECTED 
+
+    loop every 100ms
+      Note over sdsControlThread: sdsExchange
+      sdsControlThread->>Server: SDSIO_CMD_INFO
+      Note over sdsControlThread: sdsioClientReceiveGetCount<br/>(header available) 
     activate Server
-    Note over sdsControlThread: sdsRecPlayInit
-    sdsControlThread->>Server: SDSIO_CMD_PING
-    Server-->>sdsControlThread: Response
+      Server-->>sdsControlThread: SDSIO_CMD_FLAGS: set SDS_FLAG_START
+    end
 
-    sdsControlThread->>Recorder: Create thread
-    activate Recorder
+    Note right of sdsControlThread: SDS_STATE_START
 
-    Note over sdsControlThread: sdsRecOpen
+    activate SDSIO
+ 
+    Note over sdsControlThread: sdsOpen<br/>(all streams)
     sdsControlThread->>Server: SDSIO_CMD_OPEN
-    Server-->>sdsControlThread: Response
+    Server->>sdsControlThread: Response
 
     activate AlgorithmThread
+
+    Note right of sdsControlThread: SDS_STATE_ACTIVE
+
     loop periodic
         Note over AlgorithmThread: sdsRecWrite
-        AlgorithmThread->>Recorder: Buffered data reached or crossed threshold
+        AlgorithmThread->>SDSIO: Buffered data reached or crossed threshold
         loop send all data from buffer
-            Recorder->>Server: SDSIO_CMD_WRITE
+            SDSIO->>Server: SDSIO_CMD_WRITE
         end
     end
-    deactivate AlgorithmThread
 
-    Note over sdsControlThread: sdsRecClose
-    sdsControlThread->>Recorder: Close request
-    loop send all data from buffer
-        Recorder->>Server: SDSIO_CMD_WRITE
+    loop every 100ms
+      Note over sdsControlThread: sdsExchange
+      sdsControlThread->>Server: SDSIO_CMD_INFO
+      Note over sdsControlThread: sdsioClientReceiveGetCount<br/>(header available) 
+      Server-->>sdsControlThread: SDSIO_CMD_FLAGS: clear SDS_FLAG_START
     end
-    Recorder->>sdsControlThread: Close confirm
+
+    Note right of sdsControlThread: SDS_STATE_STOP_REQ
+    deactivate AlgorithmThread
+    loop send all data from buffer
+        SDSIO->>Server: SDSIO_CMD_WRITE
+    end
+    Note right of sdsControlThread: SDS_STATE_STOP_DONE
+
+    Note over sdsControlThread: sdsClose<br/>(all streams)
     sdsControlThread->>Server: SDSIO_CMD_CLOSE
-
-    Note over sdsControlThread: sdsRecPlayUninit
-    sdsControlThread->>Recorder: Terminate thread
-    deactivate Recorder
-
+    Server->>sdsControlThread: Response
+    deactivate SDSIO
     deactivate Server
+    Note right of sdsControlThread: SDS_STATE_CONNECTED
     deactivate sdsControlThread
 ```
 
@@ -423,45 +499,63 @@ sequenceDiagram
     activate sdsControlThread
 
     participant AlgorithmThread
-    participant Playback as sdsRecPlayThread
-    participant Server as SDSIO Server
+    participant SDSIO as sdsRecPlayThread
+    participant Server as SDSIO-Server<br/>(host)
 
+    Note right of sdsControlThread: SDS_STATE_CONNECTED 
+
+    loop every 100ms
+      Note over sdsControlThread: sdsExchange
+      sdsControlThread->>Server: SDSIO_CMD_INFO
+      Note over sdsControlThread: sdsioClientReceiveGetCount<br/>(header available) 
     activate Server
-    Note over sdsControlThread: sdsRecPlayInit
-    sdsControlThread->>Server: SDSIO_CMD_PING
-    Server-->>sdsControlThread: Response
-
-    sdsControlThread->>Playback: Create thread
-    activate Playback
-
-    Note over sdsControlThread: sdsPlayOpen
-    sdsControlThread->>Server: SDSIO_CMD_OPEN
-    Server-->>sdsControlThread: Response
-    sdsControlThread->>Playback: Open request
-    loop read data until threshold is reached
-        Playback->>Server: SDSIO_CMD_READ
-        Server-->>Playback: Data
+      Server-->>sdsControlThread: SDSIO_CMD_FLAGS: set SDS_FLAG_START, set SDS_FLAG_PLAYBACK  
     end
-    Playback->>sdsControlThread: Open confirm
 
+    Note right of sdsControlThread: SDS_STATE_START
+
+    activate SDSIO
+
+    Note over sdsControlThread: sdsOpen<br/>(all streams)
+    sdsControlThread->>Server: SDSIO_CMD_OPEN
+    Server->>sdsControlThread: Response
+
+    loop read data until threshold is reached
+        sdsControlThread->>Server: SDSIO_CMD_READ
+        Server->>sdsControlThread: Data
+    end
+  
     activate AlgorithmThread
+
+    Note right of sdsControlThread: SDS_STATE_ACTIVE
+
     loop periodic
-        Note over AlgorithmThread: sdsPlayRead
-        AlgorithmThread->>Playback: Buffer data falls below threshold
+        Note over AlgorithmThread: sdsRead
+        AlgorithmThread->>SDSIO: Buffer data falls below threshold
         loop read data to fill the buffer
-            Playback->>Server: SDSIO_CMD_READ
-            Server-->>Playback: Data
+            SDSIO->>Server: SDSIO_CMD_READ
+            Server-->>SDSIO: Data
         end
     end
+
+    loop every 100ms
+      Note over sdsControlThread: sdsExchange
+      sdsControlThread->>Server: SDSIO_CMD_INFO
+      Note over sdsControlThread: sdsioClientReceiveGetCount<br/>(header available) 
+      Server-->>sdsControlThread: SDSIO_CMD_FLAGS: clear SDS_FLAG_START
+    end
+
+    Note right of sdsControlThread: SDS_STATE_STOP_REQ
+
     deactivate AlgorithmThread
+    Note right of sdsControlThread: SDS_STATE_STOP_DONE
 
-    Note over sdsControlThread: sdsPlayClose
+    Note over sdsControlThread: sdsClose<br/>(all streams)
     sdsControlThread->>Server: SDSIO_CMD_CLOSE
-
-    Note over sdsControlThread: sdsRecPlayUninit
-    sdsControlThread->>Playback: Terminate thread
-    deactivate Playback
-
+    Server->>sdsControlThread: Response
+    deactivate SDSIO
     deactivate Server
+
+    Note right of sdsControlThread: SDS_STATE_CONNECTED
     deactivate sdsControlThread
 ```
